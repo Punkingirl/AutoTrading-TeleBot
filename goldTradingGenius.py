@@ -86,7 +86,7 @@ def place_order(signal, tp_value, label):
         "tp": tp_value,
         "comment": f"TG Signal {label}",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": mt5.ORDER_FILLING_RETURN,
     }
 
     result = mt5.order_send(request)
