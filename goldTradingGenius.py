@@ -22,6 +22,9 @@ LOT_SIZE = float(config['Settings']['lot_size'])
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger(__name__)
 
+# Track placed signals to avoid duplicates
+placed_signals = set()
+
 # Connect to MT5
 def connect_mt5():
     if not mt5.initialize():
@@ -65,7 +68,11 @@ def parse_signal(text):
     if tp3:   signal['tp3']   = float(tp3.group(1))
     if tp4:   signal['tp4']   = float(tp4.group(1))
 
-    return signal
+    return signal if 'sl' in signal and 'tp1' in signal else None
+
+def get_signal_key(signal):
+    """Create a unique key for a signal to detect duplicates"""
+    return f"{signal['symbol']}_{signal['direction']}_{signal.get('entry')}_{signal.get('tp1')}"
 
 # Place order in MT5
 def place_order(signal, tp_value, label):
@@ -93,8 +100,20 @@ def place_order(signal, tp_value, label):
     if result.retcode == mt5.TRADE_RETCODE_DONE:
         log.info(f"✅ Order placed: {signal['direction'].upper()} {symbol} {label} @ {price} TP={tp_value}")
     else:
-        log.error(f"❌ Order failed: {result.comment}")
+        log.error(f"❌ Order failed: {result.comment} (code: {result.retcode})")
     return result
+
+def process_signal(signal):
+    """Process and place orders for a signal, avoiding duplicates"""
+    key = get_signal_key(signal)
+    if key in placed_signals:
+        log.info(f"⏭️ Signal already placed, skipping: {key}")
+        return
+    placed_signals.add(key)
+    log.info(f"🚦 Placing orders for: {signal}")
+    for tp_key in ['tp1', 'tp2', 'tp3', 'tp4']:
+        if tp_key in signal:
+            place_order(signal, signal[tp_key], tp_key.upper())
 
 # Main bot
 async def main():
@@ -111,10 +130,7 @@ async def main():
         log.info(f"📩 New message: {text[:80]}")
         signal = parse_signal(text)
         if signal:
-            log.info(f"🚦 Signal detected: {signal}")
-            for tp_key in ['tp1', 'tp2', 'tp3', 'tp4']:
-                if tp_key in signal:
-                    place_order(signal, signal[tp_key], tp_key.upper())
+            process_signal(signal)
         else:
             log.info("ℹ️ No valid signal found in message")
 
@@ -124,7 +140,9 @@ async def main():
         log.info(f"✏️ Edited message: {text[:80]}")
         signal = parse_signal(text)
         if signal:
-            log.info(f"🔄 Updated signal: {signal}")
+            process_signal(signal)
+        else:
+            log.info("ℹ️ No valid signal found in edited message")
 
     await client.run_until_disconnected()
 
