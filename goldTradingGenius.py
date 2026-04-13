@@ -75,12 +75,29 @@ def get_signal_key(signal):
     return f"{signal['symbol']}_{signal['direction']}_{signal.get('entry')}_{signal.get('tp1')}"
 
 # Place order in MT5
+MAX_SPREAD = 1.0  # max acceptable spread in price units (e.g. $1.00 for XAUUSD)
+
 def place_order(signal, tp_value, label):
     symbol = signal['symbol']
     mt5.symbol_select(symbol, True)
 
-    order_type = mt5.ORDER_TYPE_BUY if signal['direction'] == 'buy' else mt5.ORDER_TYPE_SELL
+    info = mt5.symbol_info(symbol)
+    if info is None or info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
+        log.warning(f"⚠️ Market not fully open for {symbol}, skipping order")
+        return None
+
     tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        log.error(f"❌ Could not get tick data for {symbol}")
+        return None
+
+    spread = tick.ask - tick.bid
+    if spread > MAX_SPREAD:
+        log.warning(f"⚠️ Spread too wide ({spread:.2f}), skipping {label}")
+        return None
+    log.info(f"📊 Spread: {spread:.2f}")
+
+    order_type = mt5.ORDER_TYPE_BUY if signal['direction'] == 'buy' else mt5.ORDER_TYPE_SELL
     price = tick.ask if signal['direction'] == 'buy' else tick.bid
 
     request = {
@@ -96,11 +113,20 @@ def place_order(signal, tp_value, label):
         "type_filling": mt5.ORDER_FILLING_RETURN,
     }
 
-    result = mt5.order_send(request)
-    if result.retcode == mt5.TRADE_RETCODE_DONE:
-        log.info(f"✅ Order placed: {signal['direction'].upper()} {symbol} {label} @ {price} TP={tp_value}")
-    else:
-        log.error(f"❌ Order failed: {result.comment} (code: {result.retcode})")
+    for filling in [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_FOK]:
+        request["type_filling"] = filling
+        result = mt5.order_send(request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            log.info(f"✅ Order placed: {signal['direction'].upper()} {symbol} {label} @ {price} TP={tp_value} (filling={filling})")
+            return result
+        elif result.retcode == 10030:
+            log.warning(f"⚠️ Filling mode {filling} rejected, trying next...")
+            continue
+        else:
+            log.error(f"❌ Order failed: {result.comment} (code: {result.retcode})")
+            return result
+
+    log.error(f"❌ All filling modes failed for {symbol} {label}")
     return result
 
 def process_signal(signal):
@@ -109,11 +135,19 @@ def process_signal(signal):
     if key in placed_signals:
         log.info(f"⏭️ Signal already placed, skipping: {key}")
         return
-    placed_signals.add(key)
     log.info(f"🚦 Placing orders for: {signal}")
+    success = False
     for tp_key in ['tp1', 'tp2', 'tp3', 'tp4']:
         if tp_key in signal:
-            place_order(signal, signal[tp_key], tp_key.upper())
+            result = place_order(signal, signal[tp_key], tp_key.upper())
+            if result is None:
+                continue
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                success = True
+    if success:
+        placed_signals.add(key)
+    else:
+        log.warning(f"⚠️ No orders succeeded for {key} — will retry on next edit")
 
 # Main bot
 async def main():
@@ -126,8 +160,13 @@ async def main():
 
     @client.on(events.NewMessage(chats=SOURCE_CHANNEL_ID))
     async def handler(event):
-        text = event.message.message
-        log.info(f"📩 New message: {text[:80]}")
+        msg_id = event.message.id
+        log.info(f"📩 New message received (id={msg_id}), waiting 5s for edits...")
+        await asyncio.sleep(5)
+        # Re-fetch the latest version of the message in case it was edited
+        msg = await client.get_messages(SOURCE_CHANNEL_ID, ids=msg_id)
+        text = msg.message
+        log.info(f"📩 Processing message: {text[:80]}")
         signal = parse_signal(text)
         if signal:
             process_signal(signal)
