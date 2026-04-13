@@ -17,6 +17,7 @@ MT5_LOGIN = int(config['MetaTrader']['login'])
 MT5_PASSWORD = config['MetaTrader']['password']
 MT5_SERVER = config['MetaTrader']['server']
 LOT_SIZE = float(config['Settings']['lot_size'])
+TP1_LOT_SIZE = float(config['Settings'].get('tp1_lot_size', LOT_SIZE))
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -24,6 +25,9 @@ log = logging.getLogger(__name__)
 
 # Track placed signals to avoid duplicates
 placed_signals = set()
+
+# Last successfully placed signal (used for reenter)
+last_signal = None
 
 # Connect to MT5
 def connect_mt5():
@@ -74,10 +78,37 @@ def get_signal_key(signal):
     """Create a unique key for a signal to detect duplicates"""
     return f"{signal['symbol']}_{signal['direction']}_{signal.get('entry')}_{signal.get('tp1')}"
 
+def reconstruct_price(shorthand, reference_price):
+    """Expand a 2-digit shorthand price (e.g. 65) to full price (e.g. 4665)
+    using the current market price as reference."""
+    if shorthand >= 1000:
+        return float(shorthand)  # already a full price
+    base = int(reference_price / 100) * 100
+    candidate = base + shorthand
+    # Check adjacent hundreds in case we're near a boundary
+    for alt in [candidate + 100, candidate - 100]:
+        if abs(reference_price - alt) < abs(reference_price - candidate):
+            candidate = alt
+    return float(candidate)
+
+def parse_reenter(text):
+    """Parse a reenter message. Handles:
+      - 'Reenter 65 / SL 25'  → specific price and SL
+      - 'Reenter'             → market price, use last signal's SL
+    """
+    if not re.search(r'\bre-?enter\b', text, re.IGNORECASE):
+        return None
+    entry_match = re.search(r're-?enter[:\s]+([\d.]+)', text, re.IGNORECASE)
+    sl_match    = re.search(r'SL[:\s]+([\d.]+)', text, re.IGNORECASE)
+    return {
+        'entry_short': float(entry_match.group(1)) if entry_match else None,
+        'sl_short':    float(sl_match.group(1))    if sl_match    else None,
+    }
+
 # Place order in MT5
 MAX_SPREAD = 1.0  # max acceptable spread in price units (e.g. $1.00 for XAUUSD)
 
-def place_order(signal, tp_value, label):
+def place_order(signal, tp_value, label, lot_size=LOT_SIZE):
     symbol = signal['symbol']
     mt5.symbol_select(symbol, True)
 
@@ -103,7 +134,7 @@ def place_order(signal, tp_value, label):
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
-        "volume": LOT_SIZE,
+        "volume": lot_size,
         "type": order_type,
         "price": price,
         "sl": signal.get('sl', 0),
@@ -131,6 +162,7 @@ def place_order(signal, tp_value, label):
 
 def process_signal(signal):
     """Process and place orders for a signal, avoiding duplicates"""
+    global last_signal
     key = get_signal_key(signal)
     if key in placed_signals:
         log.info(f"⏭️ Signal already placed, skipping: {key}")
@@ -139,15 +171,41 @@ def process_signal(signal):
     success = False
     for tp_key in ['tp1', 'tp2', 'tp3', 'tp4']:
         if tp_key in signal:
-            result = place_order(signal, signal[tp_key], tp_key.upper())
+            lot = TP1_LOT_SIZE if tp_key == 'tp1' else LOT_SIZE
+            result = place_order(signal, signal[tp_key], tp_key.upper(), lot_size=lot)
             if result is None:
                 continue
             if result.retcode == mt5.TRADE_RETCODE_DONE:
                 success = True
     if success:
         placed_signals.add(key)
+        last_signal = signal
     else:
         log.warning(f"⚠️ No orders succeeded for {key} — will retry on next edit")
+
+def handle_reenter(text):
+    """Try to process a reenter message using the last placed signal's TPs"""
+    reenter = parse_reenter(text)
+    if not reenter:
+        return False
+    if not last_signal:
+        log.warning("⚠️ Reenter received but no previous signal to reference")
+        return True
+    tick = mt5.symbol_info_tick(last_signal['symbol'])
+    if not tick:
+        log.error(f"❌ Could not get tick for reenter on {last_signal['symbol']}")
+        return True
+    ref = tick.ask if last_signal['direction'] == 'buy' else tick.bid
+
+    # Use provided shorthand price or fall back to current market price
+    entry = reconstruct_price(reenter['entry_short'], ref) if reenter['entry_short'] else ref
+    # Use provided SL or fall back to last signal's SL
+    sl    = reconstruct_price(reenter['sl_short'], ref) if reenter['sl_short'] else last_signal.get('sl', 0)
+
+    signal = {**last_signal, 'entry': entry, 'sl': sl}
+    log.info(f"🔄 Reenter signal: {last_signal['direction'].upper()} {last_signal['symbol']} @ {entry} SL={sl}")
+    process_signal(signal)
+    return True
 
 # Main bot
 async def main():
@@ -170,7 +228,7 @@ async def main():
         signal = parse_signal(text)
         if signal:
             process_signal(signal)
-        else:
+        elif not handle_reenter(text):
             log.info("ℹ️ No valid signal found in message")
 
     @client.on(events.MessageEdited(chats=SOURCE_CHANNEL_ID))
@@ -180,7 +238,7 @@ async def main():
         signal = parse_signal(text)
         if signal:
             process_signal(signal)
-        else:
+        elif not handle_reenter(text):
             log.info("ℹ️ No valid signal found in edited message")
 
     await client.run_until_disconnected()
