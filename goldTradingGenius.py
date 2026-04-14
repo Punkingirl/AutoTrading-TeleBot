@@ -29,6 +29,12 @@ placed_signals = set()
 # Last successfully placed signal (used for reenter)
 last_signal = None
 
+# Ticket numbers from last placed signal {tp_key: ticket}
+last_tickets = {}
+
+# Flag to cancel TP1 monitoring if needed
+sl_monitor_task = None
+
 # Connect to MT5
 def connect_mt5():
     if not mt5.initialize():
@@ -162,13 +168,14 @@ def place_order(signal, tp_value, label, lot_size=LOT_SIZE):
 
 def process_signal(signal):
     """Process and place orders for a signal, avoiding duplicates"""
-    global last_signal
+    global last_signal, last_tickets
     key = get_signal_key(signal)
     if key in placed_signals:
         log.info(f"⏭️ Signal already placed, skipping: {key}")
         return
     log.info(f"🚦 Placing orders for: {signal}")
     success = False
+    tickets = {}
     for tp_key in ['tp1', 'tp2', 'tp3', 'tp4']:
         if tp_key in signal:
             lot = TP1_LOT_SIZE if tp_key == 'tp1' else LOT_SIZE
@@ -176,12 +183,69 @@ def process_signal(signal):
             if result is None:
                 continue
             if result.retcode == mt5.TRADE_RETCODE_DONE:
+                tickets[tp_key] = result.order
                 success = True
     if success:
         placed_signals.add(key)
         last_signal = signal
+        last_tickets = tickets
+        log.info(f"🎫 Tickets: {last_tickets}")
     else:
         log.warning(f"⚠️ No orders succeeded for {key} — will retry on next edit")
+
+def move_sl_to_entry(symbol):
+    """Move SL to entry price for all open positions on the given symbol"""
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        log.info(f"ℹ️ No open positions found for {symbol}")
+        return
+    for pos in positions:
+        request = {
+            "action":   mt5.TRADE_ACTION_SLTP,
+            "position": pos.ticket,
+            "symbol":   symbol,
+            "sl":       pos.price_open,
+            "tp":       pos.tp,
+        }
+        result = mt5.order_send(request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            log.info(f"✅ SL moved to entry ({pos.price_open}) for ticket #{pos.ticket}")
+        else:
+            log.error(f"❌ Failed to move SL for #{pos.ticket}: {result.comment} (code: {result.retcode})")
+
+async def monitor_tp1_then_move_sl(symbol, tp1_ticket):
+    """Watch for TP1 to close, then move SL to entry on remaining positions"""
+    global sl_monitor_task
+    log.info(f"👁️ Monitoring TP1 ticket #{tp1_ticket} — will move SL to entry when hit...")
+    while True:
+        await asyncio.sleep(5)
+        positions = mt5.positions_get(ticket=tp1_ticket)
+        if not positions:
+            log.info(f"🎯 TP1 hit! Moving SL to entry for remaining {symbol} positions...")
+            move_sl_to_entry(symbol)
+            sl_monitor_task = None
+            return
+
+def handle_sl_to_entry(text):
+    """Detect 'SL entry TP1' — arm monitor that moves SL when TP1 closes"""
+    global sl_monitor_task
+    if not re.search(r'\bSL\s+entry\b', text, re.IGNORECASE):
+        return False
+    if not last_signal:
+        log.warning("⚠️ SL entry received but no previous signal to reference")
+        return True
+    tp1_ticket = last_tickets.get('tp1')
+    if not tp1_ticket:
+        log.warning("⚠️ No TP1 ticket found — cannot monitor")
+        return True
+    # Cancel any previous monitor
+    if sl_monitor_task and not sl_monitor_task.done():
+        sl_monitor_task.cancel()
+    sl_monitor_task = asyncio.create_task(
+        monitor_tp1_then_move_sl(last_signal['symbol'], tp1_ticket)
+    )
+    log.info(f"🔒 SL-to-entry armed — waiting for TP1 (ticket #{tp1_ticket}) to close")
+    return True
 
 def handle_reenter(text):
     """Try to process a reenter message using the last placed signal's TPs"""
@@ -228,6 +292,8 @@ async def main():
         signal = parse_signal(text)
         if signal:
             process_signal(signal)
+        elif handle_sl_to_entry(text):
+            pass
         elif not handle_reenter(text):
             log.info("ℹ️ No valid signal found in message")
 
@@ -238,6 +304,8 @@ async def main():
         signal = parse_signal(text)
         if signal:
             process_signal(signal)
+        elif handle_sl_to_entry(text):
+            pass
         elif not handle_reenter(text):
             log.info("ℹ️ No valid signal found in edited message")
 
