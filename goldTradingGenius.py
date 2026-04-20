@@ -35,6 +35,9 @@ last_tickets = {}
 # Flag to cancel TP1 monitoring if needed
 sl_monitor_task = None
 
+# Message IDs that have already triggered a reenter (prevents double placement)
+reenter_processed_ids = set()
+
 # Connect to MT5
 def connect_mt5():
     if not mt5.initialize():
@@ -193,6 +196,52 @@ def process_signal(signal):
     else:
         log.warning(f"⚠️ No orders succeeded for {key} — will retry on next edit")
 
+def close_all_positions(symbol):
+    """Close all open positions for the given symbol at market price"""
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        log.info(f"ℹ️ No open positions to close for {symbol}")
+        return
+    for pos in positions:
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            log.error(f"❌ Could not get tick to close #{pos.ticket}")
+            continue
+        close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+        request = {
+            "action":   mt5.TRADE_ACTION_DEAL,
+            "position": pos.ticket,
+            "symbol":   symbol,
+            "volume":   pos.volume,
+            "type":     close_type,
+            "price":    price,
+            "comment":  "TG Fully Close",
+            "type_time": mt5.ORDER_TIME_GTC,
+        }
+        for filling in [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_FOK]:
+            request["type_filling"] = filling
+            result = mt5.order_send(request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                log.info(f"✅ Closed position #{pos.ticket} @ {price}")
+                break
+            elif result.retcode == 10030:
+                continue
+            else:
+                log.error(f"❌ Failed to close #{pos.ticket}: {result.comment} (code: {result.retcode})")
+                break
+
+def handle_fully_close(text):
+    """Detect 'Fully close' and close all open positions"""
+    if not re.search(r'\bfully\s+close\b', text, re.IGNORECASE):
+        return False
+    if not last_signal:
+        log.warning("⚠️ Fully close received but no previous signal to reference")
+        return True
+    log.info(f"🚪 Closing all open {last_signal['symbol']} positions...")
+    close_all_positions(last_signal['symbol'])
+    return True
+
 def move_sl_to_entry(symbol):
     """Move SL to entry price for all open positions on the given symbol"""
     positions = mt5.positions_get(symbol=symbol)
@@ -210,6 +259,8 @@ def move_sl_to_entry(symbol):
         result = mt5.order_send(request)
         if result.retcode == mt5.TRADE_RETCODE_DONE:
             log.info(f"✅ SL moved to entry ({pos.price_open}) for ticket #{pos.ticket}")
+        elif result.retcode == 10025:  # No changes — already set
+            log.info(f"ℹ️ SL already at entry for ticket #{pos.ticket}")
         else:
             log.error(f"❌ Failed to move SL for #{pos.ticket}: {result.comment} (code: {result.retcode})")
 
@@ -227,31 +278,46 @@ async def monitor_tp1_then_move_sl(symbol, tp1_ticket):
             return
 
 def handle_sl_to_entry(text):
-    """Detect 'SL entry TP1' — arm monitor that moves SL when TP1 closes"""
+    """Detect SL entry messages:
+    - 'SL entry TP1' → arm monitor, move SL to entry once TP1 closes
+    - 'SL entry'     → immediately move SL to entry for all open positions
+    """
     global sl_monitor_task
     if not re.search(r'\bSL\s+entry\b', text, re.IGNORECASE):
         return False
     if not last_signal:
         log.warning("⚠️ SL entry received but no previous signal to reference")
         return True
-    tp1_ticket = last_tickets.get('tp1')
-    if not tp1_ticket:
-        log.warning("⚠️ No TP1 ticket found — cannot monitor")
-        return True
-    # Cancel any previous monitor
-    if sl_monitor_task and not sl_monitor_task.done():
-        sl_monitor_task.cancel()
-    sl_monitor_task = asyncio.create_task(
-        monitor_tp1_then_move_sl(last_signal['symbol'], tp1_ticket)
-    )
-    log.info(f"🔒 SL-to-entry armed — waiting for TP1 (ticket #{tp1_ticket}) to close")
+
+    # 'SL entry TP1' — wait for TP1 to close first
+    if re.search(r'\bTP1\b', text, re.IGNORECASE):
+        tp1_ticket = last_tickets.get('tp1')
+        if not tp1_ticket:
+            log.warning("⚠️ No TP1 ticket found — cannot monitor")
+            return True
+        if sl_monitor_task and not sl_monitor_task.done():
+            sl_monitor_task.cancel()
+        sl_monitor_task = asyncio.create_task(
+            monitor_tp1_then_move_sl(last_signal['symbol'], tp1_ticket)
+        )
+        log.info(f"🔒 SL-to-entry armed — waiting for TP1 (ticket #{tp1_ticket}) to close")
+    else:
+        # 'SL entry' alone — move SL to entry immediately
+        log.info(f"🔒 Moving SL to entry immediately for all open {last_signal['symbol']} positions...")
+        move_sl_to_entry(last_signal['symbol'])
+
     return True
 
-def handle_reenter(text):
+def handle_reenter(text, msg_id=None):
     """Try to process a reenter message using the last placed signal's TPs"""
     reenter = parse_reenter(text)
     if not reenter:
         return False
+    if msg_id is not None:
+        if msg_id in reenter_processed_ids:
+            log.info(f"⏭️ Reenter already processed for message {msg_id}, skipping")
+            return True
+        reenter_processed_ids.add(msg_id)
     if not last_signal:
         log.warning("⚠️ Reenter received but no previous signal to reference")
         return True
@@ -292,21 +358,26 @@ async def main():
         signal = parse_signal(text)
         if signal:
             process_signal(signal)
+        elif handle_fully_close(text):
+            pass
         elif handle_sl_to_entry(text):
             pass
-        elif not handle_reenter(text):
+        elif not handle_reenter(text, msg_id=msg_id):
             log.info("ℹ️ No valid signal found in message")
 
     @client.on(events.MessageEdited(chats=SOURCE_CHANNEL_ID))
     async def edit_handler(event):
+        msg_id = event.message.id
         text = event.message.message
         log.info(f"✏️ Edited message: {text[:80]}")
         signal = parse_signal(text)
         if signal:
             process_signal(signal)
+        elif handle_fully_close(text):
+            pass
         elif handle_sl_to_entry(text):
             pass
-        elif not handle_reenter(text):
+        elif not handle_reenter(text, msg_id=msg_id):
             log.info("ℹ️ No valid signal found in edited message")
 
     await client.run_until_disconnected()
