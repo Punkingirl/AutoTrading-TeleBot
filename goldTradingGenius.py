@@ -38,6 +38,9 @@ sl_monitor_task = None
 # Message IDs that have already triggered a reenter (prevents double placement)
 reenter_processed_ids = set()
 
+# Partial signal accumulating data across multiple messages
+pending_signal = None
+
 # Connect to MT5
 def connect_mt5():
     if not mt5.initialize():
@@ -82,6 +85,59 @@ def parse_signal(text):
     if tp4:   signal['tp4']   = float(tp4.group(1))
 
     return signal if 'sl' in signal and 'tp1' in signal else None
+
+def parse_quick_signal(text):
+    """Parse fast 'Buy now XXXX' / 'Sell now XXXX' messages that omit symbol or SL"""
+    if not re.search(r'\b(buy|sell)\s+now\b', text, re.IGNORECASE):
+        return None
+    direction = 'buy' if re.search(r'\bbuy\b', text, re.IGNORECASE) else 'sell'
+
+    entry_match = re.search(r'(?:buy|sell)\s+now\s+([\d.]+)', text, re.IGNORECASE)
+    if not entry_match:
+        return None
+
+    signal = {'direction': direction, 'entry': float(entry_match.group(1))}
+
+    sym = re.search(r'\b(XAUUSD|EURUSD|GBPUSD|USDJPY|GBPJPY|XAGUSD|[A-Z]{6})\b', text)
+    if sym:
+        signal['symbol'] = sym.group(1)
+    elif last_signal:
+        signal['symbol'] = last_signal['symbol']
+    else:
+        return None
+
+    sl = re.search(r'SL[:\s]+([\d.]+)', text, re.IGNORECASE)
+    if sl:
+        signal['sl'] = float(sl.group(1))
+    elif last_signal and 'sl' in last_signal:
+        signal['sl'] = last_signal['sl']
+
+    for tp_key in ['tp1', 'tp2', 'tp3', 'tp4']:
+        m = re.search(rf'{tp_key}[:\s]+([\d.]+)', text, re.IGNORECASE)
+        if m:
+            signal[tp_key] = float(m.group(1))
+
+    # "Close TP1 Now at XXXX" sets TP1
+    tp1_close = re.search(r'close\s+tp1\s+now\s+at\s+([\d.]+)', text, re.IGNORECASE)
+    if tp1_close and 'tp1' not in signal:
+        signal['tp1'] = float(tp1_close.group(1))
+
+    return signal
+
+def parse_tp_update(text):
+    """Parse a TP-only follow-up message (no direction/symbol/entry)"""
+    if re.search(r'\b(buy|sell)\b', text, re.IGNORECASE):
+        return None  # full signal, not a TP update
+    tps = {}
+    for tp_key in ['tp1', 'tp2', 'tp3', 'tp4']:
+        m = re.search(rf'{tp_key}[:\s]+([\d.]+)', text, re.IGNORECASE)
+        if m:
+            tps[tp_key] = float(m.group(1))
+    # Also catch "Close TP1 Now at XXXX"
+    tp1_close = re.search(r'close\s+tp1\s+now\s+at\s+([\d.]+)', text, re.IGNORECASE)
+    if tp1_close:
+        tps['tp1'] = float(tp1_close.group(1))
+    return tps if tps else None
 
 def get_signal_key(signal):
     """Create a unique key for a signal to detect duplicates"""
@@ -337,6 +393,32 @@ def handle_reenter(text, msg_id=None):
     process_signal(signal)
     return True
 
+def handle_quick_signal(text):
+    """Handle fast 'Buy/Sell now XXXX' signals and TP follow-up messages"""
+    global pending_signal
+
+    # Check for TP-only follow-up first
+    tp_update = parse_tp_update(text)
+    if tp_update and pending_signal is not None:
+        pending_signal.update(tp_update)
+        log.info(f"⏳ TPs added to pending signal: {pending_signal}")
+        if 'tp1' in pending_signal and 'sl' in pending_signal:
+            log.info(f"✅ Pending signal complete, placing...")
+            process_signal(pending_signal)
+            pending_signal = None
+        return True
+
+    # Check for a quick signal
+    quick = parse_quick_signal(text)
+    if not quick:
+        return False
+    if 'tp1' in quick and 'sl' in quick:
+        process_signal(quick)
+    else:
+        pending_signal = quick
+        log.info(f"⏳ Partial signal stored, waiting for TPs: {quick}")
+    return True
+
 # Main bot
 async def main():
     if not connect_mt5():
@@ -362,7 +444,9 @@ async def main():
             pass
         elif handle_sl_to_entry(text):
             pass
-        elif not handle_reenter(text, msg_id=msg_id):
+        elif handle_reenter(text, msg_id=msg_id):
+            pass
+        elif not handle_quick_signal(text):
             log.info("ℹ️ No valid signal found in message")
 
     @client.on(events.MessageEdited(chats=SOURCE_CHANNEL_ID))
@@ -377,7 +461,9 @@ async def main():
             pass
         elif handle_sl_to_entry(text):
             pass
-        elif not handle_reenter(text, msg_id=msg_id):
+        elif handle_reenter(text, msg_id=msg_id):
+            pass
+        elif not handle_quick_signal(text):
             log.info("ℹ️ No valid signal found in edited message")
 
     await client.run_until_disconnected()
