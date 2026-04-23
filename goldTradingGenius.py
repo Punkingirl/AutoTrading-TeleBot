@@ -253,10 +253,18 @@ def process_signal(signal):
         log.warning(f"⚠️ No orders succeeded for {key} — will retry on next edit")
 
 def close_all_positions(symbol):
-    """Close all open positions for the given symbol at market price"""
-    positions = mt5.positions_get(symbol=symbol)
+    """Close all positions placed by the bot for the given symbol"""
+    tickets = list(last_tickets.values())
+    if not tickets:
+        log.info(f"ℹ️ No bot-placed positions to close for {symbol}")
+        return
+    positions = []
+    for ticket in tickets:
+        result = mt5.positions_get(ticket=ticket)
+        if result:
+            positions.extend(result)
     if not positions:
-        log.info(f"ℹ️ No open positions to close for {symbol}")
+        log.info(f"ℹ️ No open bot positions found for {symbol}")
         return
     for pos in positions:
         tick = mt5.symbol_info_tick(symbol)
@@ -299,10 +307,18 @@ def handle_fully_close(text):
     return True
 
 def move_sl_to_entry(symbol):
-    """Move SL to entry price for all open positions on the given symbol"""
-    positions = mt5.positions_get(symbol=symbol)
+    """Move SL to entry price for bot-placed positions on the given symbol"""
+    tickets = list(last_tickets.values())
+    if not tickets:
+        log.info(f"ℹ️ No bot-placed positions to update for {symbol}")
+        return
+    positions = []
+    for ticket in tickets:
+        result = mt5.positions_get(ticket=ticket)
+        if result:
+            positions.extend(result)
     if not positions:
-        log.info(f"ℹ️ No open positions found for {symbol}")
+        log.info(f"ℹ️ No open bot positions found for {symbol}")
         return
     for pos in positions:
         request = {
