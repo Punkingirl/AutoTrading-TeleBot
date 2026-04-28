@@ -43,6 +43,7 @@ pending_signal = None
 
 # Connect to MT5
 def connect_mt5():
+    mt5.shutdown()  # clear any dirty state from a previous run
     if not mt5.initialize():
         log.error("MT5 initialize failed")
         return False
@@ -51,6 +52,14 @@ def connect_mt5():
         return False
     log.info(f"✅ Connected to MT5 - Account: {MT5_LOGIN}")
     return True
+
+def ensure_mt5_connected():
+    """Re-connect to MT5 if the terminal link has dropped."""
+    info = mt5.account_info()
+    if info is not None:
+        return True
+    log.warning("⚠️ MT5 connection lost — reconnecting...")
+    return connect_mt5()
 
 # Parse signal message
 def parse_signal(text):
@@ -174,6 +183,9 @@ def parse_reenter(text):
 MAX_SPREAD = 1.0  # max acceptable spread in price units (e.g. $1.00 for XAUUSD)
 
 def place_order(signal, tp_value, label, lot_size=LOT_SIZE):
+    if not ensure_mt5_connected():
+        log.error("❌ Cannot place order — MT5 reconnect failed")
+        return None
     symbol = signal['symbol']
     mt5.symbol_select(symbol, True)
 
@@ -254,6 +266,9 @@ def process_signal(signal):
 
 def close_all_positions(symbol):
     """Close all positions placed by the bot for the given symbol"""
+    if not ensure_mt5_connected():
+        log.error("❌ Cannot close positions — MT5 reconnect failed")
+        return
     tickets = list(last_tickets.values())
     if not tickets:
         log.info(f"ℹ️ No bot-placed positions to close for {symbol}")
@@ -308,6 +323,9 @@ def handle_fully_close(text):
 
 def move_sl_to_entry(symbol):
     """Move SL to entry price for bot-placed positions on the given symbol"""
+    if not ensure_mt5_connected():
+        log.error("❌ Cannot move SL — MT5 reconnect failed")
+        return
     tickets = list(last_tickets.values())
     if not tickets:
         log.info(f"ℹ️ No bot-placed positions to update for {symbol}")
