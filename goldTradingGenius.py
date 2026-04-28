@@ -297,7 +297,7 @@ def close_all_positions(symbol):
 
 def handle_fully_close(text):
     """Detect 'Fully close' and close all open positions"""
-    if not re.search(r'\bfully\s+close\b', text, re.IGNORECASE):
+    if not re.search(r'\bfully\s*close', text, re.IGNORECASE):
         return False
     if not last_signal:
         log.warning("⚠️ Fully close received but no previous signal to reference")
